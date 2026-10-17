@@ -1,0 +1,62 @@
+# Virtual Environment
+my_venv/
+venv/
+.venv/
+
+# Environment Variables
+.env
+
+# Real recipient data — never commit personal information.
+# The example file is explicitly re-included below.
+recipients*.csv
+!recipients_example.csv
+
+# Personal attachment documents (supply your own; only samples are tracked)
+attachments/certificate.pdf
+attachments/Certificate.pdf
+attachments/Psalms 23 declaration.pdf
+
+# Python Cache
+__pycache__/
+*.py[cod]
+
+# Logs
+logs/
+*.log
+
+# Reports
+reports/*.csv
+
+# Screenshot images may show real console output (recipient emails);
+# review them before ever sharing. Keep them local by default.
+reports/images/
+
+# VS Code
+.vscode/
+
+# PyCharm
+.idea/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Build Files
+build/
+dist/
+*.egg-info/
+
+# Coverage
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# pytest
+.pytest_cache/
+
+# Local agent/tool state
+.forge/

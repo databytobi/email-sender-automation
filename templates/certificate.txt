@@ -1,0 +1,10 @@
+Hello {name},
+
+Congratulations!
+
+You have successfully completed the course.
+
+Please find your certificate attached.
+
+Regards,
+Training Team

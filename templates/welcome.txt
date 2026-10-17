@@ -1,0 +1,8 @@
+Hello {name},
+
+Welcome to our first Python Course!
+
+We're excited to have you.
+
+Best regards,
+Tobi

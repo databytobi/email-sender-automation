@@ -1,0 +1,8 @@
+Hello {name},
+
+Here are this week's updates.
+
+We hope you enjoy reading them.
+
+Best regards,
+Marketing Team

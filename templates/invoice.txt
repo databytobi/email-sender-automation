@@ -1,0 +1,8 @@
+Hello {name},
+
+Thank you for your purchase.
+
+Your invoice is attached.
+
+Regards,
+Finance Department
