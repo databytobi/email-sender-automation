@@ -85,6 +85,10 @@ UNSUBSCRIBE_MAILTO = os.getenv("UNSUBSCRIBE_MAILTO", "").strip()
 # unsubscribes). Gitignored on purpose.
 SUPPRESSION_FILE = BASE_DIR / os.getenv("SUPPRESSION_FILE", "suppression.csv")
 
+# Per-campaign registries of successfully-sent addresses, used by
+# --resume after a crashed/interrupted run. Gitignored on purpose.
+STATE_FOLDER = BASE_DIR / os.getenv("STATE_FOLDER", "state")
+
 # ==========================================
 # Templates
 # ==========================================

@@ -26,6 +26,7 @@ from providers.base import (
     RetryableDeliveryError,
 )
 from reports.report_generator import save_report
+from state import clear_sent_registry, load_sent_registry, record_sent
 from suppression import import_bounce_file, load_suppression, merge_bounces
 from unsubscribe import (
     append_footer,
@@ -108,6 +109,18 @@ def build_argument_parser():
         help="import bounced addresses from a CSV (Email column) or "
         "one-address-per-line text file into the suppression list, then exit",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip recipients already successfully sent in a previous run "
+        "of this campaign type (use after a crashed or interrupted run)",
+    )
+    parser.add_argument(
+        "--reset-sent",
+        action="store_true",
+        help="delete the sent registry for the selected campaign type "
+        "(use before an intentional re-send), then exit",
+    )
 
     return parser
 
@@ -144,7 +157,7 @@ def personalize(template, recipient, template_path):
         ) from error
 
 
-def confirm_campaign(recipients, campaign, args):
+def confirm_campaign(recipients, campaign, args, already_sent_count=0):
     """Ask for an explicit confirmation before a live campaign.
 
     Returns:
@@ -157,6 +170,13 @@ def confirm_campaign(recipients, campaign, args):
     print(f"Backend       : {args.backend}")
     print(f"Subject       : {campaign['subject']}")
     print(f"Recipients    : {len(recipients)}")
+
+    if args.resume:
+        print(
+            f"Resume        : on ({already_sent_count} address(es) already "
+            "sent will be skipped)"
+        )
+
     print("=" * 60)
 
     # Scheduled tasks have no interactive stdin: refuse instead of
@@ -262,7 +282,20 @@ def run_bounce_import(file_path):
     return 0
 
 
-def print_summary(args, report, successful, failed, suppressed, duration):
+def run_sent_registry_reset(campaign):
+    """Delete the sent registry for a campaign type."""
+    removed = clear_sent_registry(campaign)
+
+    if removed:
+        print(f"Removed sent registry for campaign '{campaign}'.")
+    else:
+        print(f"No sent registry exists for campaign '{campaign}' — "
+              "nothing to remove.")
+
+    return 0
+
+
+def print_summary(args, report, successful, failed, suppressed, resumed, duration):
     total = len(report)
     attempted = successful + failed
 
@@ -277,6 +310,10 @@ def print_summary(args, report, successful, failed, suppressed, duration):
     print(f"Campaign type    : {args.email_type}")
     print(f"Total Recipients : {total}")
     print(f"Suppressed       : {suppressed} (skipped, on suppression list)")
+
+    if args.resume:
+        print(f"Already sent     : {resumed} (skipped by --resume)")
+
     print(f"Attempted        : {attempted}")
     print(f"Successful       : {successful}")
     print(f"Failed           : {failed}")
@@ -292,7 +329,7 @@ def print_summary(args, report, successful, failed, suppressed, duration):
         print(
             f"{'Name':<15}"
             f"{'Email':<35}"
-            f"{'Status':<12}"
+            f"{'Status':<15}"
             f"{'Error'}"
         )
 
@@ -302,7 +339,7 @@ def print_summary(args, report, successful, failed, suppressed, duration):
             print(
                 f"{row['Name']:<15}"
                 f"{row['Email']:<35}"
-                f"{row['Status']:<12}"
+                f"{row['Status']:<15}"
                 f"{row['Error']}"
             )
 
@@ -322,6 +359,9 @@ def main(argv=None):
 
     if args.import_bounces:
         return run_bounce_import(args.import_bounces)
+
+    if args.reset_sent:
+        return run_sent_registry_reset(args.email_type)
 
     # -- Dry-run mode does not need credentials, only campaign files.
     try:
@@ -367,15 +407,34 @@ def main(argv=None):
     # -- Suppression list: never email these addresses again.
     suppression = load_suppression(SUPPRESSION_FILE)
 
+    # -- Sent registry: addresses already successfully sent for this
+    # campaign type. Loaded always (so live runs never write duplicates
+    # to the file), but only used for skipping when --resume is set.
+    already_sent = load_sent_registry(args.email_type)
+
+    if args.resume and already_sent:
+        logger.info(
+            f"Resume mode: {len(already_sent)} address(es) already sent "
+            f"for campaign '{args.email_type}'"
+        )
+    elif args.resume:
+        print(
+            f"Note: --resume requested, but the sent registry for "
+            f"'{args.email_type}' is empty — sending to everyone."
+        )
+
     logger.info(
         f"Starting email automation "
         f"({'dry-run' if args.dry_run else 'live'}, backend={args.backend}, "
         f"type={args.email_type}, recipients={len(recipients)}, "
-        f"suppressed={len(suppression)})"
+        f"suppressed={len(suppression)}, "
+        f"already_sent={len(already_sent)})"
     )
 
     if not args.dry_run and not args.yes:
-        if not confirm_campaign(recipients, campaign, args):
+        if not confirm_campaign(
+            recipients, campaign, args, already_sent_count=len(already_sent)
+        ):
             logger.warning("Campaign aborted by user before sending.")
             print("Campaign aborted before sending.")
             return 1
@@ -386,6 +445,7 @@ def main(argv=None):
     successful = 0
     failed = 0
     suppressed = 0
+    resumed = 0
 
     text_template = read_template(campaign["text_template"])
     html_template = read_template(campaign["html_template"])
@@ -429,6 +489,24 @@ def main(argv=None):
                 logger.info(
                     f"Skipping suppressed recipient "
                     f"{mask_email(recipient['Email'])}"
+                )
+                continue
+
+            # Resume mode: skip addresses already sent in a previous
+            # run of this campaign type.
+            if args.resume and recipient["Email"].lower() in already_sent:
+                resumed += 1
+                report.append(
+                    {
+                        "Name": recipient["Name"],
+                        "Email": recipient["Email"],
+                        "Status": "Already sent",
+                        "Error": "Skipped by --resume",
+                    }
+                )
+                logger.info(
+                    f"Skipping already-sent recipient "
+                    f"{mask_email(recipient['Email'])} (--resume)"
                 )
                 continue
 
@@ -494,6 +572,22 @@ def main(argv=None):
 
             if result["success"]:
                 successful += 1
+
+                # Record the send the moment it succeeds so a crash
+                # right after still leaves it resumable. Never during
+                # dry runs. The in-memory set prevents duplicate rows
+                # on intentional re-sends.
+                if not args.dry_run:
+                    email_key = recipient["Email"].lower()
+
+                    if email_key not in already_sent:
+                        record_sent(
+                            args.email_type,
+                            recipient["Email"],
+                            backend=args.backend,
+                            message_id=result.get("message_id") or "",
+                        )
+                        already_sent.add(email_key)
             else:
                 failed += 1
 
@@ -544,7 +638,7 @@ def main(argv=None):
 
     duration = time.time() - start_time
 
-    print_summary(args, report, successful, failed, suppressed, duration)
+    print_summary(args, report, successful, failed, suppressed, resumed, duration)
 
     # Timestamped report so previous campaigns are never overwritten.
     report_path = REPORTS_FOLDER / (

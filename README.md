@@ -15,6 +15,7 @@ This project demonstrates how to build a production-style email sender that supp
 - **Unsubscribe support**: HMAC-signed links, `List-Unsubscribe` + one-click (RFC 8058) headers, optional web app
 - **Bounce processing**: pull bounces from Gmail/SendGrid/SES or import from a file into a permanent suppression list
 - Suppression list checked before every campaign — bounces, complaints, and unsubscribes are never emailed again
+- **Auto-resume** (`--resume`): re-run a crashed or interrupted campaign and skip everyone already sent
 - Plain-text and HTML email support
 - Multiple email templates and attachments
 - **Dry-run mode** — preview a campaign without sending anything
@@ -54,10 +55,12 @@ Email Sender Automation/
 │   └── email_report_YYYYMMDD_HHMMSS.csv   # generated per run
 ├── scripts/
 │   └── run_email_automation.bat
+├── state/                # sent registries for --resume (created at runtime)
 ├── templates/            # .txt + .html pairs, personalize with {Name} etc.
 ├── tests/                # unit tests (python -m unittest discover)
 ├── bounces.py            # DSN parsing for bounce processing
 ├── suppression.py        # suppression list management
+├── state.py              # sent registries for auto-resume
 ├── unsubscribe.py        # tokens, footers, List-Unsubscribe headers
 ├── unsubscribe_server.py # optional web app (RFC 8058 one-click)
 ├── config.py
@@ -253,6 +256,33 @@ header and standard RFC 3464 `message/delivery-status` parts.
 
 ---
 
+## 🔁 Auto-Resume
+
+Every live send is recorded the moment it succeeds in a per-campaign
+registry (`state/sent_<type>.csv`), so a crash right after a send still
+leaves it resumable. If a run dies mid-campaign:
+
+```bash
+python main.py --resume
+```
+
+Registered addresses are skipped (report status `Already sent`) and the
+campaign continues where it stopped. Combine with `--dry-run` to preview
+exactly who would be skipped before going live.
+
+Before an **intentional** re-send of the same campaign type, clear the
+registry first — otherwise `--resume` would skip everyone:
+
+```bash
+python main.py --reset-sent
+```
+
+Notes: registries are keyed per campaign type (not per backend), so
+switching backends mid-campaign still resumes correctly; dry runs never
+write to the registry; the `state/` folder is gitignored.
+
+---
+
 ## ▶️ Running the Project
 
 Always start with a dry run to preview what would be sent:
@@ -297,6 +327,8 @@ Proceed? Type YES to continue:
 | `--no-unsubscribe` | Skip the unsubscribe footer/headers (transactional mail only) |
 | `--sync-bounces` | Pull bounces from the backend into the suppression list, then exit |
 | `--import-bounces FILE` | Import bounced addresses from a CSV/text file into the suppression list, then exit |
+| `--resume` | Skip recipients already successfully sent in a previous run of this campaign type (use after a crash/interruption) |
+| `--reset-sent` | Delete the sent registry for the selected campaign type (before an intentional re-send), then exit |
 
 ### Exit codes
 
@@ -362,12 +394,12 @@ addresses are suppressed before the next send.
 python -m unittest discover -v
 ```
 
-The 69-test suite covers the recipient loader (validation, duplicates, BOM
+The 76-test suite covers the recipient loader (validation, duplicates, BOM
 handling), the sender (message construction, MIME types, header injection,
 reconnect semantics), configuration and backend validation, the unsubscribe
-token/footer/header machinery, suppression and bounce parsing, and every
-provider's payload builder — all without network access or optional
-dependencies installed.
+token/footer/header machinery, suppression, bounce parsing, the sent
+registries for auto-resume, and every provider's payload builder — all
+without network access or optional dependencies installed.
 
 ---
 
@@ -408,8 +440,9 @@ dependencies installed.
 - Real-time ESP webhooks for bounce events
 
 > Already implemented in this version: Gmail API / SendGrid / SES
-> backends, retry queue with reconnect, CLI arguments, unsubscribe
-> links with one-click (RFC 8058) support, and bounce processing.
+> backends, retry queue with reconnect, auto-resume (`--resume`),
+> CLI arguments, unsubscribe links with one-click (RFC 8058) support,
+> and bounce processing.
 
 ---
 

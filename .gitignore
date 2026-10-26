@@ -11,6 +11,9 @@ suppression*.csv
 client_secret*.json
 gmail_token.json
 
+# Sent registries for --resume (per-campaign send state)
+state/
+
 # Real recipient data — never commit personal information.
 # The example file is explicitly re-included below.
 recipients*.csv
