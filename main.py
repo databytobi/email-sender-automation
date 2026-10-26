@@ -1,5 +1,4 @@
 import argparse
-import smtplib
 import sys
 import time
 from html import escape
@@ -7,17 +6,52 @@ from html import escape
 from tqdm import tqdm
 
 from config import (
+    DELIVERY_BACKEND,
     EMAIL_CONFIG,
     EMAIL_TYPE,
     RECIPIENTS_FILE,
     REPORTS_FOLDER,
+    SUPPRESSION_FILE,
+    VALID_BACKENDS,
+    unsubscribe_settings,
     validate_configuration,
 )
 from loaders.recipient_loader import read_recipients
 from loaders.template_loader import read_template
 from logger import logger, mask_email
+from providers import create_delivery_provider
+from providers.base import (
+    AuthDeliveryError,
+    EmailPayload,
+    RetryableDeliveryError,
+)
 from reports.report_generator import save_report
-from sender import SMTPAuthError, connect_smtp, send_email
+from suppression import import_bounce_file, load_suppression, merge_bounces
+from unsubscribe import (
+    append_footer,
+    build_mailto_link,
+    build_unsubscribe_headers,
+    build_unsubscribe_link,
+)
+
+
+def _ensure_utf8_output():
+    """Make redirected output safe on Windows.
+
+    When stdout is a real console, Python already uses UTF-8 (or the
+    console API). When it is redirected — scheduled tasks, CI, `>` file
+    capture — Windows defaults to a legacy code page (cp1252), which
+    cannot encode the emoji used in the progress bar and summary, and
+    crashes the run. Reconfigure to UTF-8 with replacement errors.
+    """
+    encoding = (sys.stdout.encoding or "").lower().replace("-", "")
+
+    if encoding != "utf8":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            # Non-standard streams: keep as-is.
+            pass
 
 
 def build_argument_parser():
@@ -48,6 +82,31 @@ def build_argument_parser():
         "--recipients",
         default=str(RECIPIENTS_FILE),
         help="path to the recipients CSV file",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=VALID_BACKENDS,
+        default=DELIVERY_BACKEND,
+        help=f"delivery backend (default: {DELIVERY_BACKEND}); "
+        "sendgrid/ses/gmail are the bulk-safe ESP options",
+    )
+    parser.add_argument(
+        "--no-unsubscribe",
+        action="store_true",
+        help="do not add the unsubscribe footer and List-Unsubscribe headers "
+        "(transactional/one-to-one mail only)",
+    )
+    parser.add_argument(
+        "--sync-bounces",
+        action="store_true",
+        help="pull bounces from the delivery backend into the suppression "
+        "list, then exit (no campaign is sent)",
+    )
+    parser.add_argument(
+        "--import-bounces",
+        metavar="FILE",
+        help="import bounced addresses from a CSV (Email column) or "
+        "one-address-per-line text file into the suppression list, then exit",
     )
 
     return parser
@@ -85,7 +144,7 @@ def personalize(template, recipient, template_path):
         ) from error
 
 
-def confirm_campaign(recipients, campaign, email_type):
+def confirm_campaign(recipients, campaign, args):
     """Ask for an explicit confirmation before a live campaign.
 
     Returns:
@@ -94,7 +153,8 @@ def confirm_campaign(recipients, campaign, email_type):
     print("\n" + "=" * 60)
     print("⚠  LIVE CAMPAIGN READY — emails will be sent")
     print("=" * 60)
-    print(f"Campaign type : {email_type}")
+    print(f"Campaign type : {args.email_type}")
+    print(f"Backend       : {args.backend}")
     print(f"Subject       : {campaign['subject']}")
     print(f"Recipients    : {len(recipients)}")
     print("=" * 60)
@@ -117,12 +177,13 @@ def confirm_campaign(recipients, campaign, email_type):
     return reply == "yes"
 
 
-def render_bodies(campaign, recipient, text_template, html_template):
+def render_bodies(campaign, recipient, text_template, html_template, unsubscribe):
     """Render the plain-text and HTML bodies for one recipient.
 
     CSV values are HTML-escaped before going into the HTML template,
     so a crafted name (e.g. "<script>...") cannot inject markup into
-    the email.
+    the email. The unsubscribe footer and List-Unsubscribe headers are
+    attached when an unsubscribe setup is configured.
     """
     text_body = personalize(
         text_template, recipient, campaign["text_template"]
@@ -136,21 +197,87 @@ def render_bodies(campaign, recipient, text_template, html_template):
         html_template, html_context, campaign["html_template"]
     )
 
-    return text_body, html_body
+    headers = {}
+
+    if unsubscribe:
+        https_link = None
+        mailto_link = None
+
+        if unsubscribe["base_url"]:
+            https_link = build_unsubscribe_link(
+                recipient["Email"],
+                unsubscribe["base_url"],
+                unsubscribe["secret"],
+            )
+
+        if unsubscribe["mailto"]:
+            mailto_link = build_mailto_link(
+                recipient["Email"], unsubscribe["mailto"], unsubscribe["secret"]
+            )
+
+        text_body, html_body = append_footer(
+            text_body, html_body, https_link, mailto_link
+        )
+        headers = build_unsubscribe_headers(https_link, mailto_link)
+
+    return text_body, html_body, headers
 
 
-def print_summary(args, report, successful, failed, duration):
+def run_bounce_sync(backend):
+    """Pull bounces from the delivery backend into the suppression list."""
+    provider = create_delivery_provider(backend)
+
+    if not provider.supports_bounce_sync:
+        provider.fetch_bounces()
+        print(
+            f"The {backend} backend cannot sync bounces automatically."
+        )
+        return 0
+
+    provider.connect()
+
+    bounces = provider.fetch_bounces()
+
+    provider.close()
+
+    added = merge_bounces(SUPPRESSION_FILE, bounces, source=f"{backend}-sync")
+
+    print(f"Synced {len(bounces)} bounce(s) from {backend}; "
+          f"{added} new address(es) added to {SUPPRESSION_FILE}.")
+
+    return 0
+
+
+def run_bounce_import(file_path):
+    """Import bounced addresses from a file into the suppression list."""
+    try:
+        added = import_bounce_file(file_path, SUPPRESSION_FILE)
+    except FileNotFoundError:
+        print(f"Bounce import file not found: {file_path}")
+        return 1
+
+    print(f"Imported bounces from {file_path}; "
+          f"{added} new address(es) added to {SUPPRESSION_FILE}.")
+
+    return 0
+
+
+def print_summary(args, report, successful, failed, suppressed, duration):
     total = len(report)
+    attempted = successful + failed
 
-    success_rate = (successful / total) * 100 if total else 0
+    success_rate = (successful / attempted) * 100 if attempted else 0
 
     print("\n" + "=" * 60)
     print("📊 EMAIL AUTOMATION SUMMARY")
     print("=" * 60)
 
     print(f"Mode             : {'Dry-run' if args.dry_run else 'Live'}")
+    print(f"Backend          : {args.backend}")
     print(f"Campaign type    : {args.email_type}")
     print(f"Total Recipients : {total}")
+    print(f"Suppressed       : {suppressed} (skipped, on suppression list)")
+    print(f"Attempted        : {attempted}")
     print(f"Successful       : {successful}")
     print(f"Failed           : {failed}")
     print(f"Success Rate     : {success_rate:.2f}%")
@@ -180,35 +307,28 @@ def print_summary(args, report, successful, failed, duration):
             )
 
 
-def _ensure_utf8_output():
-    """Make redirected output safe on Windows.
-
-    When stdout is a real console, Python already uses UTF-8 (or the
-    console API). When it is redirected — scheduled tasks, CI, `>` file
-    capture — Windows defaults to a legacy code page (cp1252), which
-    cannot encode the emoji used in the progress bar and summary, and
-    crashes the run. Reconfigure to UTF-8 with replacement errors.
-    """
-    encoding = (sys.stdout.encoding or "").lower().replace("-", "")
-
-    if encoding != "utf8":
-        try:
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError, OSError):
-            # Non-standard streams: keep as-is.
-            pass
-
-
 def main(argv=None):
     _ensure_utf8_output()
 
     args = build_argument_parser().parse_args(argv)
+
+    # -- Standalone maintenance operations (no campaign is sent).
+    if args.sync_bounces:
+        try:
+            return run_bounce_sync(args.backend)
+        except AuthDeliveryError as error:
+            print(f"\n❌ {error}")
+            return 2
+
+    if args.import_bounces:
+        return run_bounce_import(args.import_bounces)
 
     # -- Dry-run mode does not need credentials, only campaign files.
     try:
         validate_configuration(
             email_type=args.email_type,
             check_credentials=not args.dry_run,
+            backend=args.backend,
         )
     except ValueError as error:
         logger.error(str(error))
@@ -232,14 +352,30 @@ def main(argv=None):
         print(f"No recipients found in {args.recipients} — nothing to do.")
         return 1
 
+    # -- Unsubscribe setup (CAN-SPAM/GDPR requirement for bulk mail).
+    unsubscribe = None if args.no_unsubscribe else unsubscribe_settings()
+
+    if not args.dry_run and unsubscribe is None and not args.no_unsubscribe:
+        print(
+            "\n⚠  WARNING: no unsubscribe configuration found. Bulk email "
+            "without an unsubscribe option violates CAN-SPAM/GDPR. "
+            "Set UNSUBSCRIBE_SECRET plus UNSUBSCRIBE_BASE_URL (one-click) "
+            "and/or UNSUBSCRIBE_MAILTO in your .env."
+        )
+        logger.warning("Live campaign started without unsubscribe support.")
+
+    # -- Suppression list: never email these addresses again.
+    suppression = load_suppression(SUPPRESSION_FILE)
+
     logger.info(
         f"Starting email automation "
-        f"({'dry-run' if args.dry_run else 'live'}, type={args.email_type}, "
-        f"recipients={len(recipients)})"
+        f"({'dry-run' if args.dry_run else 'live'}, backend={args.backend}, "
+        f"type={args.email_type}, recipients={len(recipients)}, "
+        f"suppressed={len(suppression)})"
     )
 
     if not args.dry_run and not args.yes:
-        if not confirm_campaign(recipients, campaign, args.email_type):
+        if not confirm_campaign(recipients, campaign, args):
             logger.warning("Campaign aborted by user before sending.")
             print("Campaign aborted before sending.")
             return 1
@@ -249,6 +385,7 @@ def main(argv=None):
     report = []
     successful = 0
     failed = 0
+    suppressed = 0
 
     text_template = read_template(campaign["text_template"])
     html_template = read_template(campaign["html_template"])
@@ -262,21 +399,42 @@ def main(argv=None):
         file=sys.stdout,
     )
 
-    smtp = None
+    provider = None
     exit_code = None
 
     try:
-        # One connection for the whole campaign instead of one per email.
+        # One authenticated session for the whole campaign, reused for
+        # every recipient (SMTP connection, SendGrid HTTP session,
+        # Gmail/SES API client).
         if not args.dry_run:
-            smtp = connect_smtp()
+            provider = create_delivery_provider(args.backend)
+            provider.connect()
 
         for recipient in progress:
 
             progress.set_postfix(recipient=recipient["Name"])
 
+            # Never email suppressed addresses (bounces, complaints,
+            # past unsubscribes).
+            if recipient["Email"].lower() in suppression:
+                suppressed += 1
+                report.append(
+                    {
+                        "Name": recipient["Name"],
+                        "Email": recipient["Email"],
+                        "Status": "Suppressed",
+                        "Error": "On suppression list",
+                    }
+                )
+                logger.info(
+                    f"Skipping suppressed recipient "
+                    f"{mask_email(recipient['Email'])}"
+                )
+                continue
+
             try:
-                text_body, html_body = render_bodies(
-                    campaign, recipient, text_template, html_template
+                text_body, html_body, headers = render_bodies(
+                    campaign, recipient, text_template, html_template, unsubscribe
                 )
             except ValueError as error:
                 logger.error(str(error))
@@ -293,36 +451,44 @@ def main(argv=None):
 
             logger.info(
                 f"Sending email to {recipient['Name']} "
-                f"({mask_email(recipient['Email'])})..."
+                f"({mask_email(recipient['Email'])}) via {args.backend}..."
+            )
+
+            payload = EmailPayload(
+                to_email=recipient["Email"],
+                subject=campaign["subject"],
+                text_body=text_body,
+                html_body=html_body,
+                attachment_paths=campaign["attachments"],
+                extra_headers=headers,
+                # SendGrid passes these through to webhook events, so
+                # bounces can be attributed to this campaign later.
+                custom_args={"campaign": args.email_type},
             )
 
             if args.dry_run:
-                result = {"success": True, "error": None}
+                result = {"success": True, "error": None, "message_id": None}
             else:
-                # Reconnect once if the connection drops mid-campaign
+                # Reconnect once if the session drops mid-campaign
                 # instead of marking the recipient as permanently failed.
                 attempts = 2
 
                 while True:
                     try:
-                        result = send_email(
-                            smtp,
-                            recipient_email=recipient["Email"],
-                            subject=campaign["subject"],
-                            text_body=text_body,
-                            html_body=html_body,
-                            attachment_paths=campaign["attachments"],
-                        )
+                        result = provider.send(payload)
                         break
-                    except smtplib.SMTPServerDisconnected:
+                    except RetryableDeliveryError as error:
                         if attempts > 1:
                             attempts -= 1
-                            logger.warning("Reconnecting to the SMTP server...")
-                            smtp = connect_smtp()
+                            logger.warning(
+                                f"Reconnecting to {args.backend} after: {error}"
+                            )
+                            provider.reconnect()
                         else:
                             result = {
                                 "success": False,
-                                "error": "SMTP server disconnected",
+                                "error": f"Connection lost after retry: {error}",
+                                "message_id": None,
                             }
                             break
 
@@ -354,17 +520,12 @@ def main(argv=None):
 
             logger.info(f"Finished processing {recipient['Name']}")
 
-    except SMTPAuthError as error:
+    except AuthDeliveryError as error:
         # Wrong credentials: abort the whole campaign instead of
-        # hammering the server for every remaining recipient.
+        # hammering the provider for every remaining recipient.
         logger.error(str(error))
         print(f"\n❌ {error}")
-        print("Campaign aborted — fix EMAIL_ADDRESS / EMAIL_PASSWORD and re-run.")
-        exit_code = 2
-
-    except smtplib.SMTPException as error:
-        logger.error(f"Could not connect to the SMTP server: {error}")
-        print(f"\n❌ Could not connect to the SMTP server: {error}")
+        print("Campaign aborted — fix the backend credentials and re-run.")
         exit_code = 2
 
     except KeyboardInterrupt:
@@ -375,15 +536,15 @@ def main(argv=None):
     finally:
         progress.close()
 
-        if smtp:
+        if provider is not None:
             try:
-                smtp.quit()
+                provider.close()
             except Exception:
-                logger.warning("Could not close the SMTP connection cleanly.")
+                logger.warning("Could not close the delivery session cleanly.")
 
     duration = time.time() - start_time
 
-    print_summary(args, report, successful, failed, duration)
+    print_summary(args, report, successful, failed, suppressed, duration)
 
     # Timestamped report so previous campaigns are never overwritten.
     report_path = REPORTS_FOLDER / (

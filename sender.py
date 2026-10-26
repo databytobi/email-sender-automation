@@ -71,6 +71,88 @@ def _is_valid_email(recipient_email):
     )
 
 
+def build_email_message(
+    recipient_email,
+    subject,
+    text_body,
+    html_body=None,
+    attachment_paths=None,
+    extra_headers=None,
+    sender_email=None,
+    sender_name=None,
+):
+    """Build a complete EmailMessage.
+
+    Shared by the SMTP backend (sends it directly), the Gmail API
+    backend (serializes it to base64url), and usable anywhere else a
+    MIME message is needed.
+
+    Args:
+        extra_headers: Optional dict of headers to add, e.g.
+            {"List-Unsubscribe": "<mailto:...>"}.
+        sender_email: Override the From address (defaults to
+            EMAIL_ADDRESS). The Gmail backend passes its authenticated
+            account; SES passes its verified identity.
+        sender_name: Override the display name (defaults to SENDER_NAME).
+
+    Raises:
+        ValueError: If the recipient address is invalid.
+        FileNotFoundError: If an attachment does not exist.
+    """
+    if not _is_valid_email(recipient_email):
+        raise ValueError(f"Invalid recipient email address: {recipient_email}")
+
+    message = EmailMessage()
+
+    message["From"] = (
+        f"{_clean_header(sender_name or SENDER_NAME)} "
+        f"<{sender_email or EMAIL_ADDRESS}>"
+    )
+    message["To"] = recipient_email
+    message["Subject"] = _clean_header(subject)
+
+    for header_name, header_value in (extra_headers or {}).items():
+        message[_clean_header(header_name)] = _clean_header(header_value)
+
+    # Plain-text version
+    message.set_content(text_body)
+
+    # HTML version
+    if html_body:
+        message.add_alternative(
+            html_body,
+            subtype="html",
+        )
+
+    # Multiple attachments
+    if attachment_paths:
+        for attachment_path in attachment_paths:
+
+            attachment = Path(attachment_path)
+
+            if not attachment.is_file():
+                raise FileNotFoundError(
+                    f"{attachment} does not exist."
+                )
+
+            # Real MIME type instead of a generic octet-stream, so
+            # PDFs are recognized and previewed by mail clients.
+            maintype, subtype = (
+                mimetypes.guess_type(attachment.name)[0]
+                or "application/octet-stream"
+            ).split("/", 1)
+
+            with attachment.open("rb") as file:
+                message.add_attachment(
+                    file.read(),
+                    maintype=maintype,
+                    subtype=subtype,
+                    filename=attachment.name,
+                )
+
+    return message
+
+
 def send_email(
     smtp,
     recipient_email,
@@ -78,6 +160,7 @@ def send_email(
     text_body,
     html_body=None,
     attachment_paths=None,
+    extra_headers=None,
 ):
     """Send one email over an existing, authenticated SMTP connection.
 
@@ -97,47 +180,14 @@ def send_email(
                 "error": "Invalid email address",
             }
 
-        message = EmailMessage()
-
-        message["From"] = f"{_clean_header(SENDER_NAME)} <{EMAIL_ADDRESS}>"
-        message["To"] = recipient_email
-        message["Subject"] = _clean_header(subject)
-
-        # Plain-text version
-        message.set_content(text_body)
-
-        # HTML version
-        if html_body:
-            message.add_alternative(
-                html_body,
-                subtype="html",
-            )
-
-        # Multiple attachments
-        if attachment_paths:
-            for attachment_path in attachment_paths:
-
-                attachment = Path(attachment_path)
-
-                if not attachment.is_file():
-                    raise FileNotFoundError(
-                        f"{attachment} does not exist."
-                    )
-
-                # Real MIME type instead of a generic octet-stream, so
-                # PDFs are recognized and previewed by mail clients.
-                maintype, subtype = (
-                    mimetypes.guess_type(attachment.name)[0]
-                    or "application/octet-stream"
-                ).split("/", 1)
-
-                with attachment.open("rb") as file:
-                    message.add_attachment(
-                        file.read(),
-                        maintype=maintype,
-                        subtype=subtype,
-                        filename=attachment.name,
-                    )
+        message = build_email_message(
+            recipient_email,
+            subject,
+            text_body,
+            html_body=html_body,
+            attachment_paths=attachment_paths,
+            extra_headers=extra_headers,
+        )
 
         smtp.send_message(message)
 
@@ -146,6 +196,13 @@ def send_email(
         return {
             "success": True,
             "error": None,
+        }
+
+    except ValueError as error:
+        logger.warning(str(error))
+        return {
+            "success": False,
+            "error": "Invalid email address",
         }
 
     except FileNotFoundError as error:

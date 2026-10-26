@@ -1,0 +1,16 @@
+# Optional extras for the ESP delivery backends and the unsubscribe server.
+# Install the ones you need (or all of them):
+
+# SendGrid backend
+requests
+
+# Gmail API backend
+google-auth
+google-auth-oauthlib
+google-api-python-client
+
+# Amazon SES backend
+boto3
+
+# Unsubscribe web app (unsubscribe_server.py)
+flask

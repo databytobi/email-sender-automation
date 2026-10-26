@@ -70,5 +70,89 @@ class ValidateConfigurationTests(unittest.TestCase):
             self.assertIn("SMTP_PORT", str(context.exception))
 
 
+class BackendValidationTests(unittest.TestCase):
+    def test_unknown_backend_is_rejected(self):
+        with self.assertRaises(ValueError) as context:
+            config.validate_configuration(
+                email_type="welcome", check_credentials=False, backend="pigeon"
+            )
+
+        self.assertIn("smtp", str(context.exception))
+        self.assertIn("sendgrid", str(context.exception))
+
+    def test_sendgrid_backend_requires_api_key(self):
+        with mock.patch.object(config, "SENDGRID_API_KEY", None), \
+             mock.patch.object(config, "EMAIL_ADDRESS", None):
+            with self.assertRaises(ValueError) as context:
+                config.validate_configuration(
+                    email_type="welcome",
+                    check_credentials=True,
+                    backend="sendgrid",
+                )
+
+        self.assertIn("SENDGRID_API_KEY", str(context.exception))
+
+    def test_gmail_backend_requires_credentials_file(self):
+        with mock.patch.object(config, "GMAIL_CREDENTIALS_FILE",
+                               config.BASE_DIR / "does-not-exist.json"):
+            with self.assertRaises(ValueError) as context:
+                config.validate_configuration(
+                    email_type="welcome",
+                    check_credentials=True,
+                    backend="gmail",
+                )
+
+        self.assertIn("GMAIL_CREDENTIALS_FILE", str(context.exception))
+
+    def test_ses_backend_requires_from_address(self):
+        with mock.patch.object(config, "SES_FROM_ADDRESS", None):
+            with self.assertRaises(ValueError) as context:
+                config.validate_configuration(
+                    email_type="welcome",
+                    check_credentials=True,
+                    backend="ses",
+                )
+
+        self.assertIn("SES_FROM_ADDRESS", str(context.exception))
+
+    def test_dry_run_skips_all_credential_checks_for_any_backend(self):
+        # Even with zero credentials configured, a dry run must work —
+        # it only renders emails.
+        with mock.patch.object(config, "EMAIL_ADDRESS", None), \
+             mock.patch.object(config, "EMAIL_PASSWORD", None), \
+             mock.patch.object(config, "SENDGRID_API_KEY", None), \
+             mock.patch.object(config, "SES_FROM_ADDRESS", None):
+            for backend in config.VALID_BACKENDS:
+                with self.subTest(backend=backend):
+                    config.validate_configuration(
+                        email_type="welcome",
+                        check_credentials=False,
+                        backend=backend,
+                    )
+
+
+class UnsubscribeSettingsTests(unittest.TestCase):
+    def test_disabled_without_secret(self):
+        with mock.patch.object(config, "UNSUBSCRIBE_SECRET", ""), \
+             mock.patch.object(config, "UNSUBSCRIBE_BASE_URL", "https://x.com"), \
+             mock.patch.object(config, "UNSUBSCRIBE_MAILTO", "u@x.com"):
+            self.assertIsNone(config.unsubscribe_settings())
+
+    def test_disabled_without_any_target(self):
+        with mock.patch.object(config, "UNSUBSCRIBE_SECRET", "s3cret"), \
+             mock.patch.object(config, "UNSUBSCRIBE_BASE_URL", ""), \
+             mock.patch.object(config, "UNSUBSCRIBE_MAILTO", ""):
+            self.assertIsNone(config.unsubscribe_settings())
+
+    def test_enabled_with_secret_and_mailto(self):
+        with mock.patch.object(config, "UNSUBSCRIBE_SECRET", "s3cret"), \
+             mock.patch.object(config, "UNSUBSCRIBE_BASE_URL", ""), \
+             mock.patch.object(config, "UNSUBSCRIBE_MAILTO", "unsub@x.com"):
+            settings = config.unsubscribe_settings()
+
+        self.assertEqual(settings["mailto"], "unsub@x.com")
+        self.assertEqual(settings["secret"], "s3cret")
+
+
 if __name__ == "__main__":
     unittest.main()

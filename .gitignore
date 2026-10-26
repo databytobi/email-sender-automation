@@ -6,6 +6,11 @@ venv/
 # Environment Variables
 .env
 
+# Suppression list (unsubscribes/bounces) and Google OAuth secrets
+suppression*.csv
+client_secret*.json
+gmail_token.json
+
 # Real recipient data — never commit personal information.
 # The example file is explicitly re-included below.
 recipients*.csv
