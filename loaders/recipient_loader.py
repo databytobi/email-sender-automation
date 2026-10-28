@@ -75,3 +75,45 @@ def read_recipients(file_path):
             recipients.append(cleaned)
 
     return recipients
+
+
+def write_recipients(file_path, recipients):
+    """Write a recipients list back to a CSV file.
+
+    Used by the web UI to persist add/remove operations. Column order
+    from the first row is preserved; recipients missing a column are
+    written with an empty value.
+
+    Args:
+        recipients: List of dicts with at least the Name and Email keys.
+    """
+    from logger import logger
+
+    fieldnames = None
+
+    for recipient in recipients:
+        if fieldnames is None:
+            fieldnames = list(recipient.keys())
+        else:
+            for key in recipient.keys():
+                if key not in fieldnames:
+                    fieldnames.append(key)
+
+    if fieldnames is None:
+        fieldnames = list(REQUIRED_COLUMNS)
+
+    for column in REQUIRED_COLUMNS:
+        if column not in fieldnames:
+            fieldnames.insert(0, column)
+
+    with open(file_path, mode="w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(
+            file, fieldnames=fieldnames, extrasaction="ignore"
+        )
+        writer.writeheader()
+
+        for recipient in recipients:
+            row = {key: recipient.get(key, "") for key in fieldnames}
+            writer.writerow(row)
+
+    logger.info(f"Saved {len(recipients)} recipient(s) to {file_path}")

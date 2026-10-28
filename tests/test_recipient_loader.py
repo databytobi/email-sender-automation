@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from loaders.recipient_loader import read_recipients
+from loaders.recipient_loader import read_recipients, write_recipients
 
 
 class ReadRecipientsTests(unittest.TestCase):
@@ -80,6 +80,53 @@ class ReadRecipientsTests(unittest.TestCase):
     def test_missing_file_raises(self):
         with self.assertRaises(FileNotFoundError):
             read_recipients(self.folder / "does-not-exist.csv")
+
+
+class WriteRecipientsTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.folder = Path(tmp.name)
+        self.path = self.folder / "recipients.csv"
+
+    def test_write_roundtrip_preserves_extra_columns(self):
+        self.path.write_text(
+            "Name,Email,Company\nAlice,a@x.com,ACME\n", encoding="utf-8"
+        )
+
+        recipients = read_recipients(self.path)
+        recipients.append({"Name": "Bob", "Email": "b@x.com", "Company": "Globex"})
+
+        write_recipients(self.path, recipients)
+
+        reloaded = read_recipients(self.path)
+        self.assertEqual(len(reloaded), 2)
+        self.assertEqual(reloaded[0]["Company"], "ACME")
+        self.assertEqual(reloaded[1]["Company"], "Globex")
+
+    def test_write_from_scratch_creates_header(self):
+        write_recipients(
+            self.path, [{"Name": "Alice", "Email": "a@x.com"}]
+        )
+
+        content = self.path.read_text(encoding="utf-8")
+        lines = content.strip().splitlines()
+
+        self.assertEqual(lines[0], "Name,Email")
+        self.assertEqual(len(read_recipients(self.path)), 1)
+
+    def test_write_missing_column_filled_with_empty_value(self):
+        self.path.write_text(
+            "Name,Email,Company\nAlice,a@x.com,ACME\n", encoding="utf-8"
+        )
+
+        recipients = read_recipients(self.path)
+        recipients.append({"Name": "Bob", "Email": "b@x.com"})
+
+        write_recipients(self.path, recipients)
+
+        reloaded = read_recipients(self.path)
+        self.assertEqual(reloaded[1]["Company"], "")
 
 
 if __name__ == "__main__":

@@ -366,6 +366,50 @@ Every run produces:
 
 ---
 
+## 🖥 Web UI — Email Studio
+
+A modern, single-page web control panel built with plain HTML/CSS/JS
+(no build step, works fully offline) served by Flask. It wraps the exact
+same modules as the CLI — campaigns, recipients, suppression, sent
+registries, and delivery reports — so nothing diverges between the UI and
+the command line.
+
+### Getting started
+
+```bash
+pip install flask          # also listed in requirements-esp.txt
+python webapp.py
+```
+
+Then open **http://127.0.0.1:5000** (override host/port with the `HOST`
+and `PORT` environment variables).
+
+### What you can do from the UI
+
+| Page | Capabilities |
+| --- | --- |
+| Dashboard | recipient / suppressed / registry counts, delivery setup, recent runs |
+| Campaigns | preview each campaign's rendered email, dry-run, or launch a send |
+| Recipients | view, add, remove recipients from `recipients.csv` |
+| Suppression | add/remove suppressed addresses (bounces, complaints, unsubscribes) |
+| Reports | browse timestamped reports, open row-by-row status, download CSV |
+| Auto-Resume | view per-campaign sent registries, clear them before a re-send |
+| Settings | non-secret config summary (backend, sender, unsubscribe mode) |
+
+### Safety by design
+
+- **Binds to `127.0.0.1`** — local machine only; never expose it to the internet without adding authentication.
+- **Live sends require explicit confirmation** — the same rule as typing `YES` in the CLI.
+- **No secrets ever reach the browser** — addresses are masked; credentials are never returned.
+- **One campaign at a time**; runs can be aborted and their partial report is still saved.
+- Dry runs never write to the sent registry and never send mail.
+
+> The web UI complements `unsubscribe_server.py` (the optional hosted
+> one-click unsubscribe endpoint) — one runs your local control panel,
+> the other hosts RFC 8058 unsubscribe clicks for your live campaigns.
+
+---
+
 ## 📅 Scheduling (Windows Task Scheduler)
 
 Use the included batch script. Non-interactive runs must pass `--yes`:
@@ -394,7 +438,7 @@ addresses are suppressed before the next send.
 python -m unittest discover -v
 ```
 
-The 76-test suite covers the recipient loader (validation, duplicates, BOM
+The 94-test suite covers the recipient loader (validation, duplicates, BOM
 handling), the sender (message construction, MIME types, header injection,
 reconnect semantics), configuration and backend validation, the unsubscribe
 token/footer/header machinery, suppression, bounce parsing, the sent
